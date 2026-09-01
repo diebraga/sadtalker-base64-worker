@@ -12,7 +12,7 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────
 FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel AS build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1-mesa-glx \
         libglib2.0-0 \
@@ -73,7 +73,7 @@ RUN mkdir -p /app/SadTalker/checkpoints /app/SadTalker/gfpgan/weights
 FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
 # Runtime system libraries only — no compiler, no git
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1-mesa-glx \
         libglib2.0-0 \
