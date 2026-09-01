@@ -30,6 +30,7 @@ import shutil
 import torch
 from time import strftime
 import os, sys, time
+import urllib.request
 
 from src.utils.preprocess import CropAndExtract
 from src.test_audio2coeff import Audio2Coeff
@@ -38,7 +39,48 @@ from src.generate_batch import get_data
 from src.generate_facerender_batch import get_facerender_data
 from src.utils.init_path import init_path
 
-from utils.file_utils import download_file, sync_checkpoints, map_network_volume, str2bool
+from utils.file_utils import download_file, map_network_volume, str2bool
+
+# Checkpoints that must be present before the worker accepts jobs.
+# These are downloaded at startup if not already on disk (e.g. on a fresh cold start).
+CHECKPOINT_FILES = [
+    ('https://github.com/OpenTalker/SadTalker/releases/download/v0.0.2-rc/mapping_00109-model.pth.tar',
+     '/app/SadTalker/checkpoints/mapping_00109-model.pth.tar'),
+    ('https://github.com/OpenTalker/SadTalker/releases/download/v0.0.2-rc/mapping_00229-model.pth.tar',
+     '/app/SadTalker/checkpoints/mapping_00229-model.pth.tar'),
+    ('https://github.com/OpenTalker/SadTalker/releases/download/v0.0.2-rc/SadTalker_V0.0.2_256.safetensors',
+     '/app/SadTalker/checkpoints/SadTalker_V0.0.2_256.safetensors'),
+    ('https://github.com/OpenTalker/SadTalker/releases/download/v0.0.2-rc/SadTalker_V0.0.2_512.safetensors',
+     '/app/SadTalker/checkpoints/SadTalker_V0.0.2_512.safetensors'),
+    ('https://github.com/xinntao/facexlib/releases/download/v0.1.0/alignment_WFLW_4HG.pth',
+     '/app/SadTalker/gfpgan/weights/alignment_WFLW_4HG.pth'),
+    ('https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth',
+     '/app/SadTalker/gfpgan/weights/detection_Resnet50_Final.pth'),
+    ('https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth',
+     '/app/SadTalker/gfpgan/weights/GFPGANv1.4.pth'),
+    ('https://github.com/xinntao/facexlib/releases/download/v0.2.2/parsing_parsenet.pth',
+     '/app/SadTalker/gfpgan/weights/parsing_parsenet.pth'),
+]
+
+
+def ensure_checkpoints():
+    """Download any missing checkpoint files. Skips files that already exist."""
+    os.makedirs('/app/SadTalker/checkpoints', exist_ok=True)
+    os.makedirs('/app/SadTalker/gfpgan/weights', exist_ok=True)
+    for url, path in CHECKPOINT_FILES:
+        if os.path.exists(path):
+            print(f'[SadTalker][startup]: {os.path.basename(path)} already present, skipping.')
+            continue
+        print(f'[SadTalker][startup]: Downloading {os.path.basename(path)} from {url} ...')
+        try:
+            urllib.request.urlretrieve(url, path)
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            print(f'[SadTalker][startup]: Saved {path} ({size_mb:.1f} MB)')
+        except Exception as e:
+            print(f'[SadTalker][ERROR]: Failed to download {url}: {e}')
+            return False, str(e)
+    print('[SadTalker][startup]: All checkpoints ready.')
+    return True, None
 
 
 def generate_video(args):
@@ -150,22 +192,18 @@ def handler(job):
     ref_pose_url = job_input.get('ref_pose_url')
 
     if not input_image_url:
-        print('[SadTalker][ERROR]: "input_image_url" is required in job input.')
-        sys.exit(1)
+        return {'error': '"input_image_url" is required in job input.'}
 
     if not input_audio_url:
-        print('[SadTalker][ERROR]: "input_audio_url" is required in job input.')
-        sys.exit(1)
+        return {'error': '"input_audio_url" is required in job input.'}
 
     job_input['source_image'], error = download_file(input_image_url, 'input_image.png')
     if error:
-        print(f'[SadTalker][ERROR]: Could not download {input_image_url}: {error}')
-        sys.exit(1)
+        return {'error': f'Could not download input_image_url: {error}'}
 
     job_input['driven_audio'], error = download_file(input_audio_url, 'input_audio.wav')
     if error:
-        print(f'[SadTalker][ERROR]: Could not download {input_audio_url}: {error}')
-        sys.exit(1)
+        return {'error': f'Could not download input_audio_url: {error}'}
 
     if ref_eyeblink_url:
         job_input['ref_eyeblink'], error = download_file(ref_eyeblink_url, 'eyeroll.mp4')
@@ -187,8 +225,7 @@ def handler(job):
     result, error = generate_video(job_input)
 
     if error:
-        print(f'[SadTalker][ERROR]: generate_video failed: {error}')
-        sys.exit(1)
+        return {'error': f'generate_video failed: {error}'}
     else:
         return {'output_video_base64': result}
 
@@ -198,8 +235,10 @@ if __name__ == "__main__":
     if error:
         print(f'[SadTalker][WARNING]: Could not map network volume: {error}')
 
-    result, error = sync_checkpoints()
-    if error:
+    # Download checkpoints at startup if not already on disk.
+    # (Checkpoints are no longer baked into the Docker image to keep it small.)
+    ok, error = ensure_checkpoints()
+    if not ok:
         print(f'[SadTalker][ERROR]: Failed to download checkpoints: {error}')
         sys.exit(1)
 
