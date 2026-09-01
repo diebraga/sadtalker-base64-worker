@@ -1,14 +1,17 @@
-# ── Lean SadTalker serverless worker ──────────────────────────────────────
-# Uses the official RunPod PyTorch base (~7 GB compressed) instead of the
-# monolithic drvpn image (~15-25 GB).  Model checkpoints are NOT baked in;
-# handler.py downloads them on first cold start via ensure_checkpoints().
-# Subsequent cold starts skip the download (files already on disk if a
-# network volume is attached, or are re-downloaded in ~3-5 min otherwise).
-# ---------------------------------------------------------------------------
+# ── Multi-stage SadTalker serverless worker ───────────────────────────────
+#
+# Stage 1 (build): pytorch/pytorch devel — has nvcc + build tools for any
+#   packages that need to compile C/CUDA extensions at install time.
+# Stage 2 (runtime): pytorch/pytorch runtime — no compiler, ~5 GB compressed
+#   vs the ~14 GB devel image that was causing RunPod pull timeouts.
+#
+# Model checkpoints are NOT baked in; handler.py downloads them at first
+# cold start via ensure_checkpoints().
+# ─────────────────────────────────────────────────────────────────────────
 
-FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
+# ── Stage 1: build ────────────────────────────────────────────────────────
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel AS build
 
-# ── System dependencies ────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libgl1-mesa-glx \
@@ -20,41 +23,73 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Clone SadTalker ────────────────────────────────────────────────────────
 WORKDIR /app
 RUN git clone --depth 1 https://github.com/OpenTalker/SadTalker.git
 
 WORKDIR /app/SadTalker
 
-# ── Python dependencies ────────────────────────────────────────────────────
-# torch/torchvision are already in the base; we only add what SadTalker needs
+# Core numeric / media deps
 RUN pip install --no-cache-dir \
-        face_alignment==1.3.5 \
+        "numpy<2" \
+        scipy \
+        scikit-image \
+        pillow \
         imageio==2.33.1 \
         imageio-ffmpeg==0.4.9 \
+    && pip cache purge
+
+# Audio deps
+RUN pip install --no-cache-dir \
         librosa \
         numba \
-        "numpy<2" \
+    && pip cache purge
+
+# Vision / face deps
+RUN pip install --no-cache-dir \
         opencv-python-headless \
-        pillow \
-        pyyaml \
-        scikit-image \
-        scipy \
-        safetensors \
-        yacs \
+        face_alignment==1.3.5 \
         kornia \
+        safetensors \
+        pyyaml \
+        yacs \
         tqdm \
-        gfpgan \
+    && pip cache purge
+
+# Face restoration deps
+RUN pip install --no-cache-dir \
         basicsr \
+        gfpgan \
         realesrgan \
         facexlib \
-        runpod \
     && pip cache purge
+
+# RunPod serverless SDK
+RUN pip install --no-cache-dir runpod && pip cache purge
 
 # Create checkpoint dirs (ensure_checkpoints() fills them at runtime)
 RUN mkdir -p /app/SadTalker/checkpoints /app/SadTalker/gfpgan/weights
 
-# ── Worker code ────────────────────────────────────────────────────────────
+# ── Stage 2: runtime ──────────────────────────────────────────────────────
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+# Runtime system libraries only — no compiler, no git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy all installed Python packages from build stage
+COPY --from=build /opt/conda/lib/python3.10/site-packages \
+                  /opt/conda/lib/python3.10/site-packages
+
+# Copy SadTalker repo (including checkpoint dirs) from build stage
+COPY --from=build /app /app
+
+# ── Worker code ───────────────────────────────────────────────────────────
 COPY handler.py /app/SadTalker/handler.py
 
 WORKDIR /app/SadTalker
