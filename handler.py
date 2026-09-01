@@ -31,6 +31,7 @@ import torch
 from time import strftime
 import os, sys, time
 import urllib.request
+import tempfile
 
 from src.utils.preprocess import CropAndExtract
 from src.test_audio2coeff import Audio2Coeff
@@ -39,10 +40,59 @@ from src.generate_batch import get_data
 from src.generate_facerender_batch import get_facerender_data
 from src.utils.init_path import init_path
 
-from utils.file_utils import download_file, map_network_volume, str2bool
 
-# Checkpoints that must be present before the worker accepts jobs.
-# These are downloaded at startup if not already on disk (e.g. on a fresh cold start).
+# ---------------------------------------------------------------------------
+# Utility helpers (inlined — no external dependency on utils.file_utils)
+# ---------------------------------------------------------------------------
+
+def download_file(url, filename):
+    """Download a file from a URL to /tmp/<filename>. Returns (path, error)."""
+    path = os.path.join('/tmp', filename)
+    try:
+        urllib.request.urlretrieve(url, path)
+        return path, None
+    except Exception as e:
+        return None, str(e)
+
+
+def decode_base64_to_file(b64_string, filename):
+    """Decode a base64 string and write it to /tmp/<filename>. Returns (path, error)."""
+    path = os.path.join('/tmp', filename)
+    try:
+        data = base64.b64decode(b64_string)
+        with open(path, 'wb') as f:
+            f.write(data)
+        return path, None
+    except Exception as e:
+        return None, str(e)
+
+
+def map_network_volume():
+    """Map RunPod network volume if RUNPOD_NETWORK_VOLUME_PATH is set."""
+    network_volume = os.environ.get('RUNPOD_NETWORK_VOLUME_PATH') or os.environ.get('NETWORK_VOLUME_PATH')
+    if not network_volume:
+        return None, None
+    try:
+        return network_volume, None
+    except Exception as e:
+        return None, str(e)
+
+
+def str2bool(v):
+    """Convert a string (or bool) to bool."""
+    if isinstance(v, bool):
+        return v
+    if str(v).lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    if str(v).lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    raise ValueError(f'Boolean value expected, got {v!r}')
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint management
+# ---------------------------------------------------------------------------
+
 CHECKPOINT_FILES = [
     ('https://github.com/OpenTalker/SadTalker/releases/download/v0.0.2-rc/mapping_00109-model.pth.tar',
      '/app/SadTalker/checkpoints/mapping_00109-model.pth.tar'),
@@ -71,7 +121,7 @@ def ensure_checkpoints():
         if os.path.exists(path):
             print(f'[SadTalker][startup]: {os.path.basename(path)} already present, skipping.')
             continue
-        print(f'[SadTalker][startup]: Downloading {os.path.basename(path)} from {url} ...')
+        print(f'[SadTalker][startup]: Downloading {os.path.basename(path)} ...')
         try:
             urllib.request.urlretrieve(url, path)
             size_mb = os.path.getsize(path) / 1024 / 1024
@@ -83,6 +133,10 @@ def ensure_checkpoints():
     return True, None
 
 
+# ---------------------------------------------------------------------------
+# Core video generation
+# ---------------------------------------------------------------------------
+
 def generate_video(args):
     try:
         old_version = False
@@ -92,27 +146,31 @@ def generate_video(args):
         save_dir = os.path.join(args['result_dir'], strftime('%Y_%m_%d_%H.%M.%S'))
         os.makedirs(save_dir, exist_ok=True)
 
-        pose_style = args.get('pose_style', os.getenv('DEFAULT_POSE_STYLE', 45))
-        device = args.get('device', os.getenv('DEFAULT_DEVICE', 'cuda'))
-        batch_size = args.get('batch_size', int(os.getenv('DEFAULT_BATCH_SIZE', 2)))
-        input_yaw_list = args.get('input_yaw', os.getenv('DEFAULT_INPUT_YAW', None))
-        input_pitch_list = args.get('input_pitch', os.getenv('DEFAULT_INPUT_PITCH', None))
-        input_roll_list = args.get('input_roll', os.getenv('DEFAULT_INPUT_ROLL', None))
-        ref_eyeblink = args.get('ref_eyeblink', os.getenv('DEFAULT_REF_EYEBLINK_URL', None))
-        ref_pose = args.get('ref_pose', os.getenv('DEFAULT_REF_POSE_URL', None))
-        size = args.get('size', int(os.getenv('DEFAULT_SIZE', 512)))
-        preprocess = args.get('preprocess', os.getenv('DEFAULT_PREPROCESS', 'full'))
-        still = args.get('still', str2bool(os.getenv('DEFAULT_STILL', 'True')) if 'DEFAULT_STILL' in os.environ else True)
-        face3d = args.get('face3dvis', str2bool(os.getenv('DEFAULT_FACE3DVIS', 'False')) if 'FACE3DVIS' in os.environ else False)
-        expression_scale = args.get('expression_scale', float(os.getenv('DEFAULT_EXPRESSION_SCALE', 1.0)))
-        enhancer = args.get('enhancer', os.getenv('DEFAULT_ENHANCER', 'gfpgan'))
-        background_enhancer = args.get('background_enhancer', os.getenv('DEFAULT_BACKGROUND_ENHANCER', None))
+        pose_style        = args.get('pose_style', int(os.getenv('DEFAULT_POSE_STYLE', 45)))
+        device            = args.get('device', os.getenv('DEFAULT_DEVICE', 'cuda'))
+        batch_size        = args.get('batch_size', int(os.getenv('DEFAULT_BATCH_SIZE', 2)))
+        input_yaw_list    = args.get('input_yaw', os.getenv('DEFAULT_INPUT_YAW', None))
+        input_pitch_list  = args.get('input_pitch', os.getenv('DEFAULT_INPUT_PITCH', None))
+        input_roll_list   = args.get('input_roll', os.getenv('DEFAULT_INPUT_ROLL', None))
+        ref_eyeblink      = args.get('ref_eyeblink', os.getenv('DEFAULT_REF_EYEBLINK_URL', None))
+        ref_pose          = args.get('ref_pose', os.getenv('DEFAULT_REF_POSE_URL', None))
+        size              = args.get('size', int(os.getenv('DEFAULT_SIZE', 512)))
+        preprocess        = args.get('preprocess', os.getenv('DEFAULT_PREPROCESS', 'full'))
+        still             = args.get('still', str2bool(os.getenv('DEFAULT_STILL', 'True')) if 'DEFAULT_STILL' in os.environ else True)
+        face3d            = args.get('face3dvis', str2bool(os.getenv('DEFAULT_FACE3DVIS', 'False')) if 'DEFAULT_FACE3DVIS' in os.environ else False)
+        expression_scale  = args.get('expression_scale', float(os.getenv('DEFAULT_EXPRESSION_SCALE', 1.0)))
+        enhancer          = args.get('enhancer', os.getenv('DEFAULT_ENHANCER', 'gfpgan'))
+        bg_enhancer       = args.get('background_enhancer', os.getenv('DEFAULT_BACKGROUND_ENHANCER', None))
 
         current_root_path = os.path.split(sys.argv[0])[0]
-        sadtalker_paths = init_path(checkpoint_dir, os.path.join(current_root_path, 'src/config'), size, old_version, preprocess)
+        sadtalker_paths = init_path(
+            checkpoint_dir,
+            os.path.join(current_root_path, 'src/config'),
+            size, old_version, preprocess
+        )
 
-        preprocess_model = CropAndExtract(sadtalker_paths, device)
-        audio_to_coeff = Audio2Coeff(sadtalker_paths, device)
+        preprocess_model   = CropAndExtract(sadtalker_paths, device)
+        audio_to_coeff     = Audio2Coeff(sadtalker_paths, device)
         animate_from_coeff = AnimateFromCoeff(sadtalker_paths, device)
 
         first_frame_dir = os.path.join(save_dir, 'first_frame_dir')
@@ -129,7 +187,6 @@ def generate_video(args):
             ref_eyeblink_videoname = os.path.splitext(os.path.split(ref_eyeblink)[-1])[0]
             ref_eyeblink_frame_dir = os.path.join(save_dir, ref_eyeblink_videoname)
             os.makedirs(ref_eyeblink_frame_dir, exist_ok=True)
-            print('[SadTalker][blink]: 3DMM Extraction for the reference video providing eye blinking')
             ref_eyeblink_coeff_path, _, _ = preprocess_model.generate(
                 ref_eyeblink, ref_eyeblink_frame_dir, preprocess, source_image_flag=False
             )
@@ -143,29 +200,31 @@ def generate_video(args):
                 ref_pose_videoname = os.path.splitext(os.path.split(ref_pose)[-1])[0]
                 ref_pose_frame_dir = os.path.join(save_dir, ref_pose_videoname)
                 os.makedirs(ref_pose_frame_dir, exist_ok=True)
-                print('[SadTalker][pose]: 3DMM Extraction for the reference video providing pose')
                 ref_pose_coeff_path, _, _ = preprocess_model.generate(
                     ref_pose, ref_pose_frame_dir, preprocess, source_image_flag=False
                 )
         else:
             ref_pose_coeff_path = None
 
-        batch = get_data(first_coeff_path, audio_path, device, ref_eyeblink_coeff_path, still=still)
+        batch      = get_data(first_coeff_path, audio_path, device, ref_eyeblink_coeff_path, still=still)
         coeff_path = audio_to_coeff.generate(batch, save_dir, pose_style, ref_pose_coeff_path)
 
         if face3d:
             from src.face3d.visualize import gen_composed_video
-            gen_composed_video(args, device, first_coeff_path, coeff_path, audio_path, os.path.join(save_dir, '3dface.mp4'))
+            gen_composed_video(args, device, first_coeff_path, coeff_path, audio_path,
+                               os.path.join(save_dir, '3dface.mp4'))
 
         data = get_facerender_data(
-            coeff_path, crop_pic_path, first_coeff_path, audio_path, batch_size, input_yaw_list,
-            input_pitch_list, input_roll_list, expression_scale=expression_scale,
-            still_mode=still, preprocess=preprocess, size=size
+            coeff_path, crop_pic_path, first_coeff_path, audio_path,
+            batch_size, input_yaw_list, input_pitch_list, input_roll_list,
+            expression_scale=expression_scale, still_mode=still,
+            preprocess=preprocess, size=size
         )
 
         result = animate_from_coeff.generate(
-            data, save_dir, pic_path, crop_info, enhancer=enhancer,
-            background_enhancer=background_enhancer, preprocess=preprocess, img_size=size
+            data, save_dir, pic_path, crop_info,
+            enhancer=enhancer, background_enhancer=bg_enhancer,
+            preprocess=preprocess, img_size=size
         )
 
         output_video_path = shutil.move(result, save_dir + '.mp4')
@@ -182,28 +241,47 @@ def generate_video(args):
         return None, e
 
 
+# ---------------------------------------------------------------------------
+# RunPod handler
+# ---------------------------------------------------------------------------
+
 def handler(job):
     job_input = job['input']
     job_input['result_dir'] = 'results'
 
-    input_image_url = job_input.get('input_image_url')
-    input_audio_url = job_input.get('input_audio_url')
+    # --- resolve image input (URL or base64) ---
+    input_image_url    = job_input.get('input_image_url')
+    input_image_base64 = job_input.get('input_image_base64')
+
+    if input_image_base64:
+        job_input['source_image'], error = decode_base64_to_file(input_image_base64, 'input_image.png')
+        if error:
+            return {'error': f'Could not decode input_image_base64: {error}'}
+    elif input_image_url:
+        job_input['source_image'], error = download_file(input_image_url, 'input_image.png')
+        if error:
+            return {'error': f'Could not download input_image_url: {error}'}
+    else:
+        return {'error': '"input_image_url" or "input_image_base64" is required in job input.'}
+
+    # --- resolve audio input (URL or base64) ---
+    input_audio_url    = job_input.get('input_audio_url')
+    input_audio_base64 = job_input.get('input_audio_base64')
+
+    if input_audio_base64:
+        job_input['driven_audio'], error = decode_base64_to_file(input_audio_base64, 'input_audio.wav')
+        if error:
+            return {'error': f'Could not decode input_audio_base64: {error}'}
+    elif input_audio_url:
+        job_input['driven_audio'], error = download_file(input_audio_url, 'input_audio.wav')
+        if error:
+            return {'error': f'Could not download input_audio_url: {error}'}
+    else:
+        return {'error': '"input_audio_url" or "input_audio_base64" is required in job input.'}
+
+    # --- optional reference videos ---
     ref_eyeblink_url = job_input.get('ref_eyeblink_url')
-    ref_pose_url = job_input.get('ref_pose_url')
-
-    if not input_image_url:
-        return {'error': '"input_image_url" is required in job input.'}
-
-    if not input_audio_url:
-        return {'error': '"input_audio_url" is required in job input.'}
-
-    job_input['source_image'], error = download_file(input_image_url, 'input_image.png')
-    if error:
-        return {'error': f'Could not download input_image_url: {error}'}
-
-    job_input['driven_audio'], error = download_file(input_audio_url, 'input_audio.wav')
-    if error:
-        return {'error': f'Could not download input_audio_url: {error}'}
+    ref_pose_url     = job_input.get('ref_pose_url')
 
     if ref_eyeblink_url:
         job_input['ref_eyeblink'], error = download_file(ref_eyeblink_url, 'eyeroll.mp4')
@@ -215,7 +293,8 @@ def handler(job):
         if error:
             print(f'[SadTalker][WARNING]: Could not download ref_pose: {error}')
 
-    if torch.cuda.is_available() and job_input.get('device') != ['cpu']:
+    # --- device ---
+    if torch.cuda.is_available() and job_input.get('device') != 'cpu':
         job_input['device'] = 'cuda'
     else:
         job_input['device'] = 'cpu'
@@ -226,17 +305,18 @@ def handler(job):
 
     if error:
         return {'error': f'generate_video failed: {error}'}
-    else:
-        return {'output_video_base64': result}
+    return {'output_video_base64': result}
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     result, error = map_network_volume()
     if error:
         print(f'[SadTalker][WARNING]: Could not map network volume: {error}')
 
-    # Download checkpoints at startup if not already on disk.
-    # (Checkpoints are no longer baked into the Docker image to keep it small.)
     ok, error = ensure_checkpoints()
     if not ok:
         print(f'[SadTalker][ERROR]: Failed to download checkpoints: {error}')
